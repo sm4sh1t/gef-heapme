@@ -27,7 +27,7 @@ _or append the line "sources ~/gef/scripts/heapme.py" to your .gdbinit._
 Import following script to push logging messages to the HeapME console:
 
 _heapme_logging.py_ :
-```
+```python
 import json
 import requests
 from pwn import *
@@ -52,7 +52,7 @@ class HeapmeLogging:
 
 ### Usage Example: ###
 
-```
+```python
 from pwn import *
 import heapme_logging
 #...
