@@ -6,24 +6,22 @@ HeapME is a tool that helps simplify heap analysis and collaboration through an 
 
 Features:
 - GEF patches to allow scripts to register functions to malloc, calloc, realloc and free events.
-- One thread is dedicated to uploading events to the HeapME server in groups. This improves debugging speed and reduces network overhead.
-- A local HTTP Log Server will receive logs sent form the exploit code, and it will add these logs to the event queue to be uploaded in the correct order.
-
-Sample URL demonstrating glibc malloc's first-fit behavior using GEF and HeapME: https://heapme.f2tc.com/wzqkgs5KNBX0ZZQ3moay
+- An HTTP Log Server will receive logs sent form the exploit code and upload them in the correct order.
 
 @htejeda
 """
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 import time
 import json
 import requests
+import socketio
+import threading
+import asyncio
+from aiohttp import web
 
-_heapme_events = []
+heapme_is_authorized = False
+heapme_is_running = False
 
-_hm_lock = threading.Lock()
-_hm_thr_event = threading.Event()
-_hm_stop_running = False
+sio = socketio.Client()
 
 LOG_SRV_HOST = '127.0.0.1'
 LOG_SRV_PORT = 4327
@@ -54,14 +52,13 @@ class HeapMeInit(GenericCommand):
     """Connect to the HeapMe URL and begins tracking dynamic heap allocation"""
 
     _cmdline_ = "heapme init"
-    _syntax_  = "{:s} <url> <key>".format(_cmdline_)
-    _example_ = "{0:s} https://heapme.f2tc.com/1a2b3c4d5e6f7g8h9i0j 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f".format(_cmdline_)
+    _syntax_  = "{:s} <url> <id> <key>".format(_cmdline_)
+    _example_ = "{0:s} https://heapme.f2tc.com 5e7f8edea867881836775db1 e50b08b0-711c-11ea-9d36-a18c10d09858".format(_cmdline_)
 
     @only_if_gdb_running
     def do_invoke(self, argv):
-        global _heapme_events, thr_updater
 
-        if not argv or len(argv) != 2:
+        if not argv or len(argv) != 3:
             self.usage()
             return
 
@@ -74,7 +71,14 @@ class HeapMeInit(GenericCommand):
                              |_|
         """.center(40))
 
-        _heapme_url = "{0:s}/{1:s}".format(argv[0], argv[1])
+        _heapme_url = argv[0]
+        _heapme_id = argv[1]
+        _heapme_key = argv[2]
+
+        if _heapme_url.endswith('/'):
+            _heapme_url = _heapme_url[:-1]
+        
+        _heapme_url = "{0:s}/{1:s}/{2:s}".format(_heapme_url, _heapme_id, _heapme_key)
         req = requests.get(_heapme_url)
         data = req.json()
 
@@ -92,14 +96,23 @@ class HeapMeInit(GenericCommand):
                 print("Bye!")
                 return
 
+        sio.connect(_heapme_url)
+        sio.emit('address', { 'id': _heapme_id, 'key': _heapme_key })
+
+        while not heapme_is_authorized:
+            time.sleep(1)
+
         ok("{0}: connected to {1}".format(
             Color.colorify("HeapME", "blue"),
             Color.colorify(argv[0], "underline blue"),
         ))
 
+        set_gef_setting("heapme.enabled", True, bool, "HeapME is Enabled")
+        set_gef_setting("heapme.verbose", False, bool, "HeapME verbose mode")
+
         _sec = checksec(get_filepath())
 
-        _heapme_events.append({
+        heapme_push({
             'type': 'begin',
             'filepath': get_filepath(),
             'checksec': {
@@ -111,29 +124,15 @@ class HeapMeInit(GenericCommand):
             }
         })
 
-        set_gef_setting("heapme.push_on_update", True, bool, "Push events on each update")
-        set_gef_setting("heapme.wait_before_push", 5, bool, "Wait before push")
-        set_gef_setting("heapme.enabled", True, bool, "HeapME is Enablbed")
-        set_gef_setting("heapme.url", _heapme_url, str, "HeapME URL")
         gef_on_exit_hook(self.clean)
-
-        if not hm_thr_updater.is_alive():
-            hm_thr_updater.start()
-
-        if not hm_thr_log_srv.is_alive():
-            hm_thr_log_srv.start()
-
-        heapme_push()
 
     @gef_heap_event("__libc_malloc", "__libc_calloc", "__libc_realloc", "__libc_free")
     def heap_event(**kwargs):
-        global _heapme_events
 
         if not get_gef_setting("heapme.enabled"):
-            err("HeapME is not enabled, run 'heapme init' first")
             return
 
-        _heapme_events.append({
+        heapme_push({
             "type": kwargs["name"],
             "data": {
                 "address": kwargs["address"],
@@ -156,16 +155,13 @@ class HeapMeInit(GenericCommand):
                 print("Please respond with 'y' or 'n' (or 'yes' or 'no')")
 
     def clean(self, event):
-        global _heapme_events, _hm_stop_running
+        global heapme_is_running
 
         print("Hold on, {0} is exiting cleanly".format(Color.colorify("HeapME", "blue")), end="...")
 
-        _heapme_events.append({'type': 'done'})
-        heapme_push()
-
-        if get_gef_setting("heapme.push_on_update"):
-            _hm_stop_running = True
-            _hm_thr_event.set()
+        heapme_push({'type': 'done'})
+        sio.disconnect()
+        heapme_is_running = False
 
         print("Adios!")
         gef_on_exit_unhook(self.clean)
@@ -186,7 +182,6 @@ class HeapMeWatch(GenericCommand):
             return
 
         if not get_gef_setting("heapme.enabled"):
-            err("HeapME is not enabled, run 'heapme init' first")
             return
 
         HeapMeWatchAddress(argv[0])
@@ -204,10 +199,23 @@ class HeapMePush(GenericCommand):
     def do_invoke(self, argv):
 
         if not get_gef_setting("heapme.enabled"):
-            err("HeapME is not enabled, run 'heapme init' first")
             return
 
         heapme_push()
+
+@sio.event
+def message(data):
+    global heapme_is_authorized
+
+    if type(data) is dict and data['authorized']:
+        heapme_is_authorized = True
+        return
+    else:
+        err("{0:s}: {1:s}".format(Color.colorify("HeapME", "blue"), data))
+        sio.disconnect()
+
+    print(data)
+
 
 class HeapMeWatchAddress(gdb.Breakpoint):
     def stop(self):
@@ -219,12 +227,12 @@ def _get_heap_segment():
 
     heap_section = [x for x in get_process_maps() if x.path == "[heap]"]
     if not heap_section:
-        err("No heap section")
+        #err("No heap section")
         return
 
     arena = get_main_arena()
     if arena is None:
-        err("No valid arena")
+        #err("No valid arena")
         return
 
     heap_section = heap_section[0].page_start
@@ -238,7 +246,8 @@ def _get_heap_segment():
 
 def heapme_update():
 
-    global _heapme_events, _hm_lock
+    if not get_gef_setting("heapme.enabled"):
+        return
 
     #Used to restore previous gef.disable_color setting
     _prev_gef_disable_color = get_gef_setting("gef.disable_color")
@@ -269,99 +278,53 @@ def heapme_update():
         { 'type':'unsorted', 'data': str(unsorted) },
         { 'type':'small', 'data': str(small) },
         { 'type':'large', 'data': str(large) },
-        { 'type':'chunks', 'chunks_summary': str(chunks), 'data': _get_heap_segment() }
+        { 'type':'chunks', 'chunks_summary': str(chunks), 'data':_get_heap_segment() }
     ]
-
-    _hm_lock.acquire()
-    _heapme_events.extend(_new_event)
-    _hm_lock.release()
 
     #Restore previous setting
     set_gef_setting("gef.disable_color", _prev_gef_disable_color)
 
-    if get_gef_setting("heapme.push_on_update"):
-        _hm_thr_event.set()
+    heapme_push(_new_event)
 
-def heapme_push():
-    global _heapme_events, _hm_lock, _hm_thr_event
+def heapme_push(heapme_events = False):
 
-    if not get_gef_setting("heapme.enabled"):
-        err("HeapME is not enabled, run 'heapme init' first")
+    if type(heapme_events) is dict:
+        heapme_events = [ heapme_events ]
+
+    if not get_gef_setting("heapme.enabled") or not heapme_events:
         return
 
-    _hm_lock.acquire()
+    if get_gef_setting("heapme.verbose"):
+        print("{0:s}: Uploading event".format(Color.colorify("HeapME", "blue")))
 
-    if not _heapme_events:
-        _hm_lock.release()
-        return
+    sio.emit('push', heapme_events)
 
-    res = requests.post(get_gef_setting("heapme.url"), json={ 'events': _heapme_events })
-
-    if res.status_code != 200:
-        print("{0:s}: Error uploading event".format(Color.colorify("HeapME", "blue")))
-        _hm_lock.release()
-        return
-
-    _heapme_events = []
-
-    _hm_lock.release()
-    _hm_thr_event.clear()
-
-class HeapmeLogServerHandler(BaseHTTPRequestHandler):
-
-    def do_POST(self):
-
-        if self.headers['content-type'] == 'application/json':
-            length = int(self.headers['content-length'])
-            body = self.rfile.read(length)
-            self.send_response(200)
-            self.end_headers()
-
-            obj = json.loads(body.decode('utf-8'))
-            if not isinstance(obj, dict) or 'msg' not in obj.keys():
-                self.send_error(400, "'msg' field not found")
-                return
-
-            _heapme_events.append({
-                'type': 'log',
-                'data': obj['msg']
-            })
-
-        else:
-            self.send_error(415, "Only JSON data is supported.")
+def hm_log_server():
+    async def logHandler(request):
+        data = await request.json()
+        
+        if not get_gef_setting("heapme.enabled"):
             return
 
-    def log_message(self, format, *args):
-        return
+        heapme_push({ 'type': 'log', 'data': data['msg'] })
 
-def _heapme_log_server():
-    httpd = HTTPServer((LOG_SRV_HOST, LOG_SRV_PORT), HeapmeLogServerHandler)
-    while not _hm_stop_running:
-        httpd.handle_request()
+        return web.Response(text="OK")
 
-hm_thr_log_srv = threading.Thread(target=_heapme_log_server, args=())
-hm_thr_log_srv.daemon = True
+    app = web.Application()
+    app.add_routes([web.post('/', logHandler)])
+    runner = web.AppRunner(app)
+    return runner
 
-def heapme_event_consumer(e):
-    """Wait for an event to be set before doing anything."""
+def hm_run_log_server(runner):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, host=LOG_SRV_HOST, port=LOG_SRV_PORT)
+    loop.run_until_complete(site.start())
+    loop.run_forever()
 
-    # We wait N seconds to avoid POSTing on each update (Default 5)
-    wait_before_push = get_gef_setting("heapme.wait_before_push")
-    if not wait_before_push:
-        wait_before_push = 5
-
-    while True:
-        e.wait()
-
-        if _hm_stop_running:
-            break
-
-        time.sleep(wait_before_push)
-        heapme_push()
-
-hm_thr_updater = threading.Thread(
-    target=heapme_event_consumer,
-    args=(_hm_thr_event,)
-)
+t = threading.Thread(target=hm_run_log_server, args=(hm_log_server(),))
+t.daemon = True
+t.start()
 
 register_external_command(HeapMe())
