@@ -3,3 +3,4 @@ keystone-engine==0.9.1.post3
 pylint==2.3.0
 ropper==1.11.6
 unicorn==1.0.1
+requests==2.23.0
