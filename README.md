@@ -68,6 +68,34 @@ log = HeapmeLogging()
 log.info('HeapME')
 ```
 
+### Using Docker: ###
+
+A docker container is provided with HeapMe and pwntools pre-installed.
+
+```bash
+# building your docker image
+docker build . -t heapme
+
+# running your exploit in the docker lab with *tmux* for split window side-by-side debugging
+# exposing logging port and host
+cd ~/my-heapme-lab
+docker run -it --cap-add=SYS_PTRACE -eLOG_SRV_HOST=0.0.0.0 --rm --name heapme_lab -v `pwd`:/root heapme tmux new -- python3 xploit.py
+```
+
+```python
+# using tmux for side-by-side debugging in your pwntools exploit
+
+# ...
+
+context.terminal = ['tmux', 'split-window', '-h']
+gdb.attach(p, '''heap-analysis-helper
+heapme init https://heapme.f2tc.com/ 5e84d30c33c2261b3254a303 7ec2a091-33c4-51ea-25d1-5de031cc6374''')
+pause()
+
+# ...
+
+```
+
 ### TODO ###
 
 * Interactive two-way communication between `HeapME` and `GEF`
