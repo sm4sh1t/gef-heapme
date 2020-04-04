@@ -16,6 +16,7 @@ import requests
 import socketio
 import threading
 import asyncio
+import os
 from aiohttp import web
 
 heapme_is_authorized = False
@@ -23,8 +24,11 @@ heapme_is_running = False
 
 sio = socketio.Client()
 
-LOG_SRV_HOST = '127.0.0.1'
-LOG_SRV_PORT = 4327
+"""
+Allow overriding default log listening host and port with environment variables
+"""
+LOG_SRV_HOST = os.getenv('LOG_SRV_HOST') or '127.0.0.1'
+LOG_SRV_PORT = int(os.getenv('LOG_SRV_PORT') or 4327)
 
 @register_command
 class HeapMe(GenericCommand):
