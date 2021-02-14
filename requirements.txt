@@ -5,5 +5,5 @@ ropper==1.11.6
 unicorn==1.0.1
 requests==2.23.0
 asyncio==3.4.3
-python-socketio==4.5.1
+python-socketio==4.6.1
 aiohttp==3.6.2
